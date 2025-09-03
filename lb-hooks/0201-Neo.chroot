@@ -2,7 +2,7 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-echo "[neo-ai] === Neo Assistant Full Integration Hook ==="
+echo "[neo-ai] === Neo Assistant Full Personal AI Hook ==="
 
 # ------------------------------------------------------------
 # 1. Remove telemetry (live system)
@@ -25,7 +25,8 @@ apt-get install -y --no-install-recommends \
   xdg-utils \
   libxcb-cursor0 libxkbcommon0 libxkbcommon-x11-0 \
   libgl1 libglib2.0-0 libdbus-1-3 \
-  qt6-base-dev qt6-base-dev-tools
+  qt6-base-dev qt6-base-dev-tools \
+  sqlite3
 
 if ! command -v ollama >/dev/null 2>&1; then
   echo "[neo-ai] Installing Ollama runtime…"
@@ -44,16 +45,16 @@ install -d -m 0755 /usr/share/icons/hicolor/64x64/apps
 
 # Policy file
 cat >/etc/neo-assistant/policy.yaml <<'YAML'
-model: qwen2.5:3b-instruct
+model: phi3:mini
 temperature: 0.6
 top_p: 0.9
 max_tokens: 1024
-agreeableness: balanced
+agreeableness: friendly
 socratic_passes: 1
 bias_prediction: true
 memory:
   db_path: ~/.local/share/neo-assistant/history.sqlite
-  max_messages: 64
+  max_messages: 128
 privacy:
   offline_only: true
   strip_pii_heuristics: true
@@ -79,14 +80,16 @@ os.makedirs(base, exist_ok=True)
 if not os.path.exists(venv):
     subprocess.check_call(["python3","-m","venv",venv])
 pip=f"{venv}/bin/pip"
-subprocess.check_call([pip,"install","--no-cache-dir","PyQt6","requests","pyyaml"])
+subprocess.check_call([pip,"install","--no-cache-dir","PyQt6","requests","pyyaml","beautifulsoup4"])
 
+# Main app
 open(f"{base}/neo_assistant.py","w").write(textwrap.dedent(r'''
 import os, sys, json, sqlite3, time, requests, re
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLineEdit, QTextEdit, QPushButton, QSystemTrayIcon, QMenu, QAction
 from PyQt6.QtGui import QIcon
-import yaml
+import yaml, threading
+from bs4 import BeautifulSoup
 
 CONFIG="/etc/neo-assistant/policy.yaml"
 cfg=yaml.safe_load(open(CONFIG))
@@ -96,18 +99,23 @@ os.makedirs(os.path.dirname(data_path), exist_ok=True)
 conn=sqlite3.connect(data_path)
 cur=conn.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, role TEXT, content TEXT, ts INTEGER)")
+cur.execute("CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT, content TEXT, ts INTEGER)")
 conn.commit()
 
 def save(role,text):
     cur.execute("INSERT INTO messages(role,content,ts) VALUES(?,?,?)",(role,text,int(time.time())))
     conn.commit()
 
-def history(limit=64):
+def remember_file(path,content):
+    cur.execute("INSERT OR REPLACE INTO files(path,content,ts) VALUES(?,?,?)",(path,content,int(time.time())))
+    conn.commit()
+
+def history(limit=128):
     cur.execute("SELECT role,content FROM messages ORDER BY id ASC")
     rows=cur.fetchall()
     return [{"role":r,"content":c} for r,c in rows][-limit:]
 
-SYSTEM_PROMPT=f"You are Neo, a local privacy-first assistant. Be {cfg['agreeableness']}, bias-aware, Socratic."
+SYSTEM_PROMPT=f"You are Neo, a friendly local assistant. Be helpful, bias-aware, Socratic, and a friend."
 
 def strip_pii(t):
     t=re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b','[email]',t)
@@ -128,12 +136,22 @@ def stream_ollama(msgs):
             yield piece
     return out
 
+# Basic web search (Google-like, just get titles)
+def web_search(query):
+    try:
+        r=requests.get(f"https://html.duckduckgo.com/html/?q={query}", timeout=3)
+        soup=BeautifulSoup(r.text,"html.parser")
+        results=[a.get_text() for a in soup.find_all("a")][:5]
+        return "\n".join(results)
+    except:
+        return "Web search unavailable."
+
 class NeoBar(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Neo Assistant")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint)
-        self.resize(900,120)
+        self.resize(900,160)
         lay=QVBoxLayout(self)
         self.input=QLineEdit(self)
         self.input.setPlaceholderText("Ask Neo…")
@@ -153,6 +171,11 @@ class NeoBar(QWidget):
         save("user",q)
         msgs=[{"role":"system","content":SYSTEM_PROMPT}]+history(cfg["memory"]["max_messages"])
         msgs.append({"role":"user","content":strip_pii(q)})
+
+        # Include basic web search summary
+        if q.lower().startswith("search:"):
+            msgs.append({"role":"assistant","content":web_search(q.replace("search:","").strip())})
+
         self.out.clear()
         reply=""
         for chunk in stream_ollama(msgs):
@@ -193,7 +216,7 @@ PY
 cat >/usr/share/applications/neo-assistant.desktop <<'DESKTOP'
 [Desktop Entry]
 Name=Neo Assistant
-Comment=Local ethical SLM
+Comment=Local personal AI companion
 Exec=/usr/local/neo-assistant/venv/bin/python /usr/local/neo-assistant/neo_assistant.py
 Icon=neo-assistant
 Terminal=false
@@ -231,17 +254,9 @@ rm -f /etc/xdg/autostart/gnome-software-service.desktop || true
 POST
 chmod +x /usr/lib/calamares/modules/neo-ai-postinstall.sh
 
-# Add to Calamares config
-if ! grep -q "neo-ai-postinstall.sh" /etc/calamares/modules.conf 2>/dev/null; then
-  echo "" >> /etc/calamares/modules.conf
-  echo "exec:" >> /etc/calamares/modules.conf
-  echo "  - neo-ai-postinstall.sh" >> /etc/calamares/modules.conf
-fi
-
-# Pre-pull models
+# Pre-pull only phi3:mini
 set +e
-ollama pull qwen2.5:3b-instruct || true
 ollama pull phi3:mini || true
 set -e
 
-echo "[neo-ai] === Neo Assistant installed, tray + streaming + autostart + telemetry removed ==="
+echo "[neo-ai] === Neo Assistant installed, tray + streaming + autostart + web + memory ==="
