@@ -1,0 +1,248 @@
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+echo "[neo-ai] === Neo Assistant Full Integration Hook ==="
+
+# ------------------------------------------------------------
+# 1. Remove telemetry (live system)
+# ------------------------------------------------------------
+echo "[neo-ai] Removing telemetry from live system…"
+apt-get purge -y --auto-remove \
+  popularity-contest whoopsie apport apport-gtk apport-kde \
+  gnome-online-accounts zeitgeist-core tracker \
+  tracker-miner-fs tracker-extract || true
+systemctl disable whoopsie.service apport.service || true
+rm -f /etc/xdg/autostart/gnome-software-service.desktop || true
+
+# ------------------------------------------------------------
+# 2. Install dependencies + Ollama
+# ------------------------------------------------------------
+apt-get update
+apt-get install -y --no-install-recommends \
+  curl ca-certificates \
+  python3 python3-venv python3-pip python3-gi \
+  python3-sqlite3 \
+  xdg-utils \
+  libxcb-cursor0 libxkbcommon0 libxkbcommon-x11-0 \
+  libgl1 libglib2.0-0 libdbus-1-3 \
+  qt6-base-dev qt6-base-dev-tools
+
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "[neo-ai] Installing Ollama runtime…"
+  curl -fsSL https://ollama.com/install.sh | sh
+fi
+systemctl enable ollama.service || true
+
+# ------------------------------------------------------------
+# 3. Install Neo Assistant app
+# ------------------------------------------------------------
+echo "[neo-ai] Installing Neo Assistant…"
+install -d -m 0755 /usr/local/neo-assistant
+install -d -m 0755 /etc/neo-assistant
+install -d -m 0755 /usr/share/applications
+install -d -m 0755 /usr/share/icons/hicolor/64x64/apps
+
+# Policy file
+cat >/etc/neo-assistant/policy.yaml <<'YAML'
+model: qwen2.5:3b-instruct
+temperature: 0.6
+top_p: 0.9
+max_tokens: 1024
+agreeableness: balanced
+socratic_passes: 1
+bias_prediction: true
+memory:
+  db_path: ~/.local/share/neo-assistant/history.sqlite
+  max_messages: 64
+privacy:
+  offline_only: true
+  strip_pii_heuristics: true
+YAML
+
+# Icon
+cat >/usr/share/icons/hicolor/64x64/apps/neo-assistant.svg <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#111827"/>
+  <circle cx="22" cy="26" r="3" fill="#10b981"/>
+  <circle cx="32" cy="26" r="3" fill="#10b981"/>
+  <circle cx="42" cy="26" r="3" fill="#10b981"/>
+  <rect x="16" y="34" width="32" height="4" rx="2" fill="#34d399"/>
+</svg>
+SVG
+
+# Python virtualenv + app
+python3 - <<'PY'
+import os, subprocess, textwrap
+base="/usr/local/neo-assistant"
+venv=f"{base}/venv"
+os.makedirs(base, exist_ok=True)
+if not os.path.exists(venv):
+    subprocess.check_call(["python3","-m","venv",venv])
+pip=f"{venv}/bin/pip"
+subprocess.check_call([pip,"install","--no-cache-dir","PyQt6","requests","pyyaml"])
+
+open(f"{base}/neo_assistant.py","w").write(textwrap.dedent(r'''
+import os, sys, json, sqlite3, time, requests, re
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLineEdit, QTextEdit, QPushButton, QSystemTrayIcon, QMenu, QAction
+from PyQt6.QtGui import QIcon
+import yaml
+
+CONFIG="/etc/neo-assistant/policy.yaml"
+cfg=yaml.safe_load(open(CONFIG))
+
+data_path=os.path.expanduser(cfg["memory"]["db_path"])
+os.makedirs(os.path.dirname(data_path), exist_ok=True)
+conn=sqlite3.connect(data_path)
+cur=conn.cursor()
+cur.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, role TEXT, content TEXT, ts INTEGER)")
+conn.commit()
+
+def save(role,text):
+    cur.execute("INSERT INTO messages(role,content,ts) VALUES(?,?,?)",(role,text,int(time.time())))
+    conn.commit()
+
+def history(limit=64):
+    cur.execute("SELECT role,content FROM messages ORDER BY id ASC")
+    rows=cur.fetchall()
+    return [{"role":r,"content":c} for r,c in rows][-limit:]
+
+SYSTEM_PROMPT=f"You are Neo, a local privacy-first assistant. Be {cfg['agreeableness']}, bias-aware, Socratic."
+
+def strip_pii(t):
+    t=re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b','[email]',t)
+    t=re.sub(r'\b\d{3}-\d{2}-\d{4}\b','[ssn]',t)
+    t=re.sub(r'\b\d{10,16}\b','[number]',t)
+    return t
+
+def stream_ollama(msgs):
+    url="http://127.0.0.1:11434/api/chat"
+    r=requests.post(url,json={"model":cfg["model"],"messages":msgs},stream=True)
+    out=""
+    for line in r.iter_lines():
+        if not line: continue
+        j=json.loads(line.decode("utf-8"))
+        if "message" in j and "content" in j["message"]:
+            piece=j["message"]["content"]
+            out+=piece
+            yield piece
+    return out
+
+class NeoBar(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Neo Assistant")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint)
+        self.resize(900,120)
+        lay=QVBoxLayout(self)
+        self.input=QLineEdit(self)
+        self.input.setPlaceholderText("Ask Neo…")
+        self.out=QTextEdit(self)
+        self.out.setReadOnly(True)
+        self.btn=QPushButton("Send (Enter)")
+        lay.addWidget(self.input)
+        lay.addWidget(self.out)
+        lay.addWidget(self.btn)
+        self.input.returnPressed.connect(self.ask)
+        self.btn.clicked.connect(self.ask)
+
+    def ask(self):
+        q=self.input.text().strip()
+        if not q: return
+        self.input.clear()
+        save("user",q)
+        msgs=[{"role":"system","content":SYSTEM_PROMPT}]+history(cfg["memory"]["max_messages"])
+        msgs.append({"role":"user","content":strip_pii(q)})
+        self.out.clear()
+        reply=""
+        for chunk in stream_ollama(msgs):
+            self.out.insertPlainText(chunk)
+            QApplication.processEvents()
+            reply+=chunk
+        save("assistant",reply)
+
+def main():
+    app = QApplication(sys.argv)
+    neo = NeoBar()
+    neo.show()
+
+    # System tray
+    tray = QSystemTrayIcon()
+    tray.setIcon(QIcon("/usr/share/icons/hicolor/64x64/apps/neo-assistant.svg"))
+    tray.setToolTip("Neo Assistant")
+    menu = QMenu()
+    show_action = QAction("Show Neo")
+    quit_action = QAction("Quit Neo")
+    menu.addAction(show_action)
+    menu.addAction(quit_action)
+    tray.setContextMenu(menu)
+
+    show_action.triggered.connect(neo.show)
+    quit_action.triggered.connect(app.quit)
+    tray.activated.connect(lambda reason: neo.show() if reason==QSystemTrayIcon.ActivationReason.Trigger else None)
+    tray.show()
+
+    sys.exit(app.exec())
+
+if __name__=="__main__":
+    main()
+'''))
+PY
+
+# Desktop entry
+cat >/usr/share/applications/neo-assistant.desktop <<'DESKTOP'
+[Desktop Entry]
+Name=Neo Assistant
+Comment=Local ethical SLM
+Exec=/usr/local/neo-assistant/venv/bin/python /usr/local/neo-assistant/neo_assistant.py
+Icon=neo-assistant
+Terminal=false
+Type=Application
+Categories=Utility;AI;
+DESKTOP
+
+# KDE Plasma shortcut Home+N
+install -d -m 0755 /etc/skel/.config
+echo "[neo-assistant.desktop]" >> /etc/skel/.config/kglobalshortcutsrc
+echo "_launch=Home+N,Home+N,Launch Neo Assistant" >> /etc/skel/.config/kglobalshortcutsrc
+
+# Autostart
+install -d -m 0755 /etc/xdg/autostart
+cat >/etc/xdg/autostart/neo-assistant.desktop <<'AUTO'
+[Desktop Entry]
+Type=Application
+Name=Neo Assistant
+Exec=/usr/local/neo-assistant/venv/bin/python /usr/local/neo-assistant/neo_assistant.py
+X-GNOME-Autostart-enabled=true
+AUTO
+
+# Calamares post-install
+install -d -m 0755 /usr/lib/calamares/modules
+cat >/usr/lib/calamares/modules/neo-ai-postinstall.sh <<'POST'
+#!/bin/bash
+set -euo pipefail
+echo "[neo-ai] Post-install: copy Neo + purge telemetry"
+[ -d /usr/local/neo-assistant ] || cp -a /run/live/rootfs/usr/local/neo-assistant /usr/local/neo-assistant
+[ -f /usr/share/applications/neo-assistant.desktop ] || cp -a /run/live/rootfs/usr/share/applications/neo-assistant.desktop /usr/share/applications/
+[ -f /usr/share/icons/hicolor/64x64/apps/neo-assistant.svg ] || cp -a /run/live/rootfs/usr/share/icons/hicolor/64x64/apps/neo-assistant.svg /usr/share/icons/hicolor/64x64/apps/
+apt-get purge -y --auto-remove popularity-contest whoopsie apport apport-gtk apport-kde gnome-online-accounts zeitgeist-core tracker tracker-miner-fs tracker-extract || true
+systemctl disable whoopsie.service apport.service || true
+rm -f /etc/xdg/autostart/gnome-software-service.desktop || true
+POST
+chmod +x /usr/lib/calamares/modules/neo-ai-postinstall.sh
+
+# Add to Calamares config
+if ! grep -q "neo-ai-postinstall.sh" /etc/calamares/modules.conf 2>/dev/null; then
+  echo "" >> /etc/calamares/modules.conf
+  echo "exec:" >> /etc/calamares/modules.conf
+  echo "  - neo-ai-postinstall.sh" >> /etc/calamares/modules.conf
+fi
+
+# Pre-pull models
+set +e
+ollama pull qwen2.5:3b-instruct || true
+ollama pull phi3:mini || true
+set -e
+
+echo "[neo-ai] === Neo Assistant installed, tray + streaming + autostart + telemetry removed ==="
