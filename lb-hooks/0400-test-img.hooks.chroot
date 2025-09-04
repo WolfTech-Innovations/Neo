@@ -1,0 +1,96 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "==== Cybr ISO Testing & First Boot Setup Hook ===="
+
+# ----------------------------------------
+# 1) Setup First-Boot Wallpaper Script
+# ----------------------------------------
+
+STARTUP_DIR="/etc/rc.local.d"
+mkdir -p "$STARTUP_DIR"
+
+# Script to run on first boot to set wallpaper for 'cybr' user
+cat > "$STARTUP_DIR/01-set-wallpaper.sh" << 'EOF'
+#!/bin/bash
+set -e
+
+USER_HOME="/home/cybr"
+WALLPAPER="$USER_HOME/Pictures/Wallpapers/cat_wallpaper.jpg"
+
+if [[ -f "$WALLPAPER" ]]; then
+    echo "Setting wallpaper for user 'cybr'..."
+    # KDE Plasma command to set wallpaper
+    mkdir -p "$USER_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    cp "$WALLPAPER" "$USER_HOME/.config/wallpaper.jpg"
+    # Actually writing desktop config for Plasma
+    cat > "$USER_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc" << 'WALL_CFG'
+[Containments][1][Wallpaper][org.kde.image][General]
+Image=file:///home/cybr/Pictures/Wallpapers/cat_wallpaper.jpg
+FillMode=2
+WALL_CFG
+    chown -R cybr:cybr "$USER_HOME/.config"
+fi
+EOF
+
+chmod +x "$STARTUP_DIR/01-set-wallpaper.sh"
+
+# Enable script to run on first boot via rc.local or systemd service
+mkdir -p /etc/systemd/system
+cat > /etc/systemd/system/cybr-firstboot.service << 'EOF'
+[Unit]
+Description=Cybr First Boot Setup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/rc.local.d/01-set-wallpaper.sh
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable cybr-firstboot.service
+
+echo "First-boot wallpaper setup complete"
+
+# ----------------------------------------
+# 2) Automated QEMU ISO Test (after build)
+# ----------------------------------------
+
+# Only run if ISO exists
+ISO_PATH="/build/live-build/images/${ISO_NAME}.iso"
+if [[ -f "$ISO_PATH" ]]; then
+    echo "Launching headless QEMU test for ISO..."
+    # Allocate small RAM for fast testing
+    qemu-system-x86_64 \
+        -m 1024 \
+        -boot d \
+        -cdrom "$ISO_PATH" \
+        -nographic \
+        -no-reboot \
+        -snapshot \
+        -monitor none \
+        -serial mon:stdio \
+        -nic none \
+        -display none \
+        -timeout 60 &
+
+    QEMU_PID=$!
+    echo "QEMU running with PID $QEMU_PID, waiting 60s for boot..."
+    sleep 60
+
+    # Check if QEMU is still running (rough boot check)
+    if ps -p $QEMU_PID > /dev/null; then
+        echo "ISO booted successfully in headless QEMU!"
+        kill $QEMU_PID
+    else
+        echo "QEMU exited early. Possible boot failure!"
+        exit 1
+    fi
+else
+    echo "ISO not found, skipping QEMU test"
+fi
+
+echo "==== Test & Startup Hook Complete ===="
